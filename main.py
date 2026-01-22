@@ -1,18 +1,60 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
 import requests
 from bs4 import BeautifulSoup
 import os
 import re
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 app = FastAPI(title="Amazon Product Verdict API")
+
+# Add CORS middleware for better compatibility
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ScraperAPI Key - Pehle Environment se lega, nahi toh yahan manually dalein
 API_KEY = os.getenv("SCRAPER_API_KEY", "0ffd10481338d1ba06b0aaa980323394")
 
 class ProductRequest(BaseModel):
-    url: str
+    url: str = Field(..., min_length=1, description="Amazon product URL")
+    
+    @field_validator('url')
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        """Validate URL format and content"""
+        if not v or not v.strip():
+            raise ValueError("URL cannot be empty")
+        
+        v = v.strip()
+        
+        # Basic URL format check
+        try:
+            parsed = urlparse(v)
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError("Invalid URL format. Must include http:// or https://")
+            
+            # Check if it's an Amazon domain
+            if 'amazon' not in parsed.netloc.lower():
+                raise ValueError("URL must be from an Amazon domain (amazon.com, amazon.co.uk, etc.)")
+            
+            # Check if it looks like a product page
+            path = parsed.path.lower()
+            if '/dp/' not in path and '/gp/product/' not in path and '/product/' not in path:
+                raise ValueError("URL must be an Amazon product page (should contain /dp/ or /gp/product/)")
+            
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Invalid URL format: {str(e)}")
+        
+        return v
 
 class VerdictResponse(BaseModel):
     product_title: str
@@ -42,7 +84,10 @@ def validate_amazon_url(url: str) -> bool:
 def scrape_amazon_page(url: str) -> str:
     """Fetch HTML content from Amazon using ScraperAPI with JavaScript rendering"""
     if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
-        raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ScraperAPI Key is missing!"
+        )
     
     # Properly encode URL parameters
     params = {
@@ -57,23 +102,41 @@ def scrape_amazon_page(url: str) -> str:
         
         # Check if response is empty
         if not response.text or len(response.text.strip()) == 0:
-            raise HTTPException(status_code=500, detail="ScraperAPI returned empty response")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="ScraperAPI returned empty response"
+            )
         
         # Check for common error indicators in HTML
         html_lower = response.text.lower()
         if 'error' in html_lower and ('access denied' in html_lower or 'blocked' in html_lower):
-            raise HTTPException(status_code=500, detail="ScraperAPI: Access denied or blocked by Amazon")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ScraperAPI: Access denied or blocked by Amazon"
+            )
         
         return response.text
     except requests.exceptions.Timeout:
-        raise HTTPException(status_code=504, detail="Request timeout: ScraperAPI took too long to respond")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Request timeout: ScraperAPI took too long to respond"
+        )
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=503, detail="Connection error: Could not reach ScraperAPI")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Connection error: Could not reach ScraperAPI"
+        )
     except requests.exceptions.HTTPError as e:
-        raise HTTPException(status_code=e.response.status_code if e.response else 500, 
-                          detail=f"ScraperAPI HTTP error: {str(e)}")
+        status_code = e.response.status_code if e.response else status.HTTP_500_INTERNAL_SERVER_ERROR
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"ScraperAPI HTTP error: {str(e)}"
+        )
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch page: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch page: {str(e)}"
+        )
 
 def extract_product_data(html: str) -> dict:
     """Extract product information from Amazon HTML"""
@@ -326,31 +389,60 @@ def calculate_verdict(reviews_count: int, bsr: int) -> str:
     else:
         return '⚠️ RISKY'
 
-@app.get("/")
+@app.get("/", status_code=status.HTTP_200_OK)
 def home():
-    return {"status": "API is Running", "docs": "/docs"}
+    """Health check endpoint"""
+    return {
+        "status": "API is Running",
+        "docs": "/docs",
+        "endpoint": "/verdict",
+        "method": "POST"
+    }
 
-@app.post("/verdict", response_model=VerdictResponse)
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
+    """Custom handler for 422 validation errors"""
+    errors = []
+    for error in exc.errors():
+        field = " -> ".join(str(loc) for loc in error["loc"])
+        message = error["msg"]
+        errors.append(f"{field}: {message}")
+    
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={
+            "detail": "Validation error",
+            "errors": errors,
+            "message": "Please provide a valid Amazon product URL"
+        }
+    )
+
+@app.post("/verdict", response_model=VerdictResponse, status_code=status.HTTP_200_OK)
 def get_verdict(request: ProductRequest):
     """
     Analyze an Amazon product and return verdict
     
-    - **url**: Amazon product URL
+    - **url**: Amazon product URL (must be a valid Amazon product page)
+    
+    Returns:
+    - product_title: Product name
+    - price: Product price
+    - reviews_count: Number of reviews
+    - bsr: Best Sellers Rank
+    - verdict: SELL, AVOID, or RISKY
     """
     if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
-        raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="ScraperAPI Key is missing! Please configure SCRAPER_API_KEY environment variable."
+        )
     
-    # Validate URL format
-    if not request.url or not request.url.strip():
-        raise HTTPException(status_code=400, detail="URL cannot be empty")
-    
-    # Validate it's an Amazon URL
-    if not validate_amazon_url(request.url):
-        raise HTTPException(status_code=400, detail="URL must be a valid Amazon product page (e.g., https://www.amazon.com/dp/PRODUCT_ID)")
+    # URL is already validated by Pydantic, but double-check
+    url = request.url.strip()
     
     try:
         # Scrape the page
-        html = scrape_amazon_page(request.url)
+        html = scrape_amazon_page(url)
         
         # Extract product data
         product_data = extract_product_data(html)
@@ -358,7 +450,7 @@ def get_verdict(request: ProductRequest):
         # Calculate verdict
         verdict = calculate_verdict(product_data['reviews_count'], product_data['bsr'])
         
-        # Return response
+        # Return response with proper status code
         return VerdictResponse(
             product_title=product_data['title'],
             price=product_data['price'],
@@ -369,9 +461,18 @@ def get_verdict(request: ProductRequest):
     except HTTPException:
         # Re-raise HTTP exceptions as-is
         raise
+    except ValueError as e:
+        # Handle validation errors
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
     except Exception as e:
-        # Catch any unexpected errors
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        # Catch any unexpected errors and return proper error response
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error occurred: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
