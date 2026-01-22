@@ -4,6 +4,7 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import re
+from urllib.parse import urlencode, urlparse
 
 app = FastAPI(title="Amazon Product Verdict API")
 
@@ -20,23 +21,70 @@ class VerdictResponse(BaseModel):
     bsr: int
     verdict: str
 
+def validate_amazon_url(url: str) -> bool:
+    """Validate if the URL is a valid Amazon product URL"""
+    try:
+        parsed = urlparse(url)
+        # Check if it's a valid URL
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        # Check if it's an Amazon domain
+        if 'amazon' not in parsed.netloc.lower():
+            return False
+        # Check if it looks like a product page (has /dp/ or /gp/product/ or /product/)
+        path = parsed.path.lower()
+        if '/dp/' in path or '/gp/product/' in path or '/product/' in path:
+            return True
+        return False
+    except Exception:
+        return False
+
 def scrape_amazon_page(url: str) -> str:
     """Fetch HTML content from Amazon using ScraperAPI with JavaScript rendering"""
     if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
         raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
     
-    # ScraperAPI URL structure with render=true
-    scraper_url = f"http://api.scraperapi.com?api_key={API_KEY}&url={url}&render=true"
+    # Properly encode URL parameters
+    params = {
+        'api_key': API_KEY,
+        'url': url,
+        'render': 'true'
+    }
     
     try:
-        response = requests.get(scraper_url, timeout=60)
+        response = requests.get("http://api.scraperapi.com", params=params, timeout=60)
         response.raise_for_status()
+        
+        # Check if response is empty
+        if not response.text or len(response.text.strip()) == 0:
+            raise HTTPException(status_code=500, detail="ScraperAPI returned empty response")
+        
+        # Check for common error indicators in HTML
+        html_lower = response.text.lower()
+        if 'error' in html_lower and ('access denied' in html_lower or 'blocked' in html_lower):
+            raise HTTPException(status_code=500, detail="ScraperAPI: Access denied or blocked by Amazon")
+        
         return response.text
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Request timeout: ScraperAPI took too long to respond")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=503, detail="Connection error: Could not reach ScraperAPI")
+    except requests.exceptions.HTTPError as e:
+        raise HTTPException(status_code=e.response.status_code if e.response else 500, 
+                          detail=f"ScraperAPI HTTP error: {str(e)}")
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch page: {str(e)}")
 
 def extract_product_data(html: str) -> dict:
     """Extract product information from Amazon HTML"""
+    if not html or len(html.strip()) == 0:
+        return {
+            'title': 'Not found',
+            'price': 'Not found',
+            'reviews_count': 0,
+            'bsr': None
+        }
+    
     soup = BeautifulSoup(html, 'html.parser')
     
     # Extract Product Title - Multiple selectors for different Amazon layouts
@@ -62,14 +110,14 @@ def extract_product_data(html: str) -> dict:
                 break
     
     # Additional fallback methods
-    if not title or title == 'Not found':
+    if not title:
         # Try finding by data attributes
         title_elem = soup.find('span', {'data-automation-id': 'title'})
         if title_elem:
             title = title_elem.get_text(strip=True)
         
         # Try finding any h1 in the product title area
-        if not title or title == 'Not found':
+        if not title:
             h1_elements = soup.find_all('h1')
             for h1 in h1_elements:
                 text = h1.get_text(strip=True)
@@ -77,7 +125,7 @@ def extract_product_data(html: str) -> dict:
                     title = text
                     break
     
-    # Extract Price
+    # Extract Price - Improved extraction with currency
     price = None
     price_selectors = [
         'span.a-price-whole',
@@ -85,8 +133,10 @@ def extract_product_data(html: str) -> dict:
         '#priceblock_ourprice',
         '#priceblock_dealprice',
         'span.a-price.a-text-price.a-size-medium.apexPriceToPay span.a-offscreen',
-        '.a-price.aok-align-center span.a-offscreen'
+        '.a-price.aok-align-center span.a-offscreen',
+        'span.a-price.aok-align-center.reinventPricePriceToPayMargin.priceToPay span.a-offscreen'
     ]
+    
     for selector in price_selectors:
         element = soup.select_one(selector)
         if element:
@@ -95,15 +145,22 @@ def extract_product_data(html: str) -> dict:
                 price = price_text
                 break
     
-    # If price not found, try alternative method
+    # If price not found, try alternative method with currency symbol
     if not price:
-        price_elem = soup.find('span', class_='a-price-whole')
-        if price_elem:
-            price = price_elem.get_text(strip=True)
-            # Try to get currency symbol
-            currency = soup.find('span', class_='a-price-symbol')
-            if currency:
-                price = currency.get_text(strip=True) + price
+        price_container = soup.find('span', class_='a-price')
+        if price_container:
+            # Try to get the whole price including currency
+            whole_price = price_container.find('span', class_='a-price-whole')
+            symbol = price_container.find('span', class_='a-price-symbol')
+            if whole_price:
+                price = whole_price.get_text(strip=True)
+                if symbol:
+                    price = symbol.get_text(strip=True) + price
+            else:
+                # Try offscreen price
+                offscreen = price_container.find('span', class_='a-offscreen')
+                if offscreen:
+                    price = offscreen.get_text(strip=True)
     
     # Extract Reviews Count - Multiple methods
     reviews_count = 0
@@ -118,8 +175,7 @@ def extract_product_data(html: str) -> dict:
         '#averageCustomerReviews span',
         '.averageCustomerReviews span',
         'a[href*="#customerReviews"] span',
-        '#reviewsMedley span',
-        'span.a-size-base'
+        '#reviewsMedley span'
     ]
     
     for selector in reviews_selectors:
@@ -133,7 +189,7 @@ def extract_product_data(html: str) -> dict:
                     reviews_count = int(numbers[0].replace(',', ''))
                     if reviews_count > 0:
                         break
-                except ValueError:
+                except (ValueError, IndexError):
                     continue
     
     # Alternative: Search in text content for review patterns
@@ -152,7 +208,7 @@ def extract_product_data(html: str) -> dict:
                     reviews_count = int(match.group(1).replace(',', ''))
                     if reviews_count > 0:
                         break
-                except ValueError:
+                except (ValueError, IndexError):
                     continue
     
     # Extract BSR (Best Sellers Rank) - Multiple extraction methods
@@ -175,7 +231,7 @@ def extract_product_data(html: str) -> dict:
                 bsr = int(match.group(1).replace(',', ''))
                 if bsr > 0:
                     break
-            except ValueError:
+            except (ValueError, IndexError):
                 continue
     
     # Method 2: Find span/li elements containing BSR text
@@ -188,7 +244,7 @@ def extract_product_data(html: str) -> dict:
             if bsr_match:
                 try:
                     bsr = int(bsr_match.group(1).replace(',', ''))
-                except ValueError:
+                except (ValueError, IndexError):
                     pass
         
         # Search for elements with BSR-related text
@@ -209,14 +265,14 @@ def extract_product_data(html: str) -> dict:
                                 if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
                                     bsr = potential_bsr
                                     break
-                            except ValueError:
+                            except (ValueError, IndexError):
                                 continue
                     else:
                         try:
                             bsr = int(bsr_match.group(1).replace(',', ''))
                             if bsr > 0:
                                 break
-                        except ValueError:
+                        except (ValueError, IndexError):
                             continue
     
     # Method 3: Look in product details section
@@ -232,7 +288,7 @@ def extract_product_data(html: str) -> dict:
             if bsr_match:
                 try:
                     bsr = int(bsr_match.group(1).replace(',', ''))
-                except ValueError:
+                except (ValueError, IndexError):
                     pass
     
     # Method 4: Search in table rows (common Amazon structure)
@@ -248,7 +304,7 @@ def extract_product_data(html: str) -> dict:
                         if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
                             bsr = potential_bsr
                             break
-                    except ValueError:
+                    except (ValueError, IndexError):
                         continue
     
     return {
@@ -260,7 +316,7 @@ def extract_product_data(html: str) -> dict:
 
 def calculate_verdict(reviews_count: int, bsr: int) -> str:
     """Calculate verdict based on reviews count and BSR"""
-    if bsr is None:
+    if bsr is None or bsr == 0:
         return '⚠️ RISKY'  # Can't determine without BSR
     
     if bsr < 20000 and reviews_count < 200:
@@ -284,27 +340,38 @@ def get_verdict(request: ProductRequest):
     if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
         raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
     
+    # Validate URL format
+    if not request.url or not request.url.strip():
+        raise HTTPException(status_code=400, detail="URL cannot be empty")
+    
     # Validate it's an Amazon URL
-    if 'amazon' not in request.url.lower():
-        raise HTTPException(status_code=400, detail="URL must be an Amazon product page")
+    if not validate_amazon_url(request.url):
+        raise HTTPException(status_code=400, detail="URL must be a valid Amazon product page (e.g., https://www.amazon.com/dp/PRODUCT_ID)")
     
-    # Scrape the page
-    html = scrape_amazon_page(request.url)
-    
-    # Extract product data
-    product_data = extract_product_data(html)
-    
-    # Calculate verdict
-    verdict = calculate_verdict(product_data['reviews_count'], product_data['bsr'])
-    
-    # Return response
-    return VerdictResponse(
-        product_title=product_data['title'],
-        price=product_data['price'],
-        reviews_count=product_data['reviews_count'],
-        bsr=product_data['bsr'] if product_data['bsr'] is not None else 0,
-        verdict=verdict
-    )
+    try:
+        # Scrape the page
+        html = scrape_amazon_page(request.url)
+        
+        # Extract product data
+        product_data = extract_product_data(html)
+        
+        # Calculate verdict
+        verdict = calculate_verdict(product_data['reviews_count'], product_data['bsr'])
+        
+        # Return response
+        return VerdictResponse(
+            product_title=product_data['title'],
+            price=product_data['price'],
+            reviews_count=product_data['reviews_count'],
+            bsr=product_data['bsr'] if product_data['bsr'] is not None else 0,
+            verdict=verdict
+        )
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        # Catch any unexpected errors
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
