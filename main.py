@@ -21,14 +21,15 @@ class VerdictResponse(BaseModel):
     verdict: str
 
 def scrape_amazon_page(url: str) -> str:
-    """Fetch HTML content from Amazon using ScraperAPI"""
+    """Fetch HTML content from Amazon using ScraperAPI with JavaScript rendering"""
     params = {
         'api_key': SCRAPERAPI_KEY,
-        'url': url
+        'url': url,
+        'render': 'true'  # Enable JavaScript rendering for Amazon
     }
     
     try:
-        response = requests.get(SCRAPERAPI_URL, params=params, timeout=30)
+        response = requests.get(SCRAPERAPI_URL, params=params, timeout=60)
         response.raise_for_status()
         return response.text
     except requests.exceptions.RequestException as e:
@@ -38,25 +39,43 @@ def extract_product_data(html: str) -> dict:
     """Extract product information from Amazon HTML"""
     soup = BeautifulSoup(html, 'html.parser')
     
-    # Extract Product Title
+    # Extract Product Title - Multiple selectors for different Amazon layouts
     title = None
     title_selectors = [
         '#productTitle',
-        'h1.a-size-large.product-title-word-break',
         'span#productTitle',
-        'h1 span.a-size-large'
+        'h1#productTitle',
+        'h1.a-size-large.product-title-word-break',
+        'h1.a-size-large',
+        'h1 span.a-size-large',
+        'h1[data-automation-id="title"]',
+        '.product-title-word-break',
+        '#title_feature_div h1',
+        '#titleSection h1',
+        'h1.a-text-normal'
     ]
     for selector in title_selectors:
         element = soup.select_one(selector)
         if element:
             title = element.get_text(strip=True)
-            break
+            if title and len(title) > 0:
+                break
     
-    if not title:
-        # Fallback: try to find any h1 with product title
-        h1 = soup.find('h1', {'id': 'productTitle'})
-        if h1:
-            title = h1.get_text(strip=True)
+    # Additional fallback methods
+    if not title or title == 'Not found':
+        # Try finding by data attributes
+        title_elem = soup.find('span', {'data-automation-id': 'title'})
+        if title_elem:
+            title = title_elem.get_text(strip=True)
+        
+        # Try finding any h1 in the product title area
+        if not title or title == 'Not found':
+            h1_elements = soup.find_all('h1')
+            for h1 in h1_elements:
+                text = h1.get_text(strip=True)
+                if text and len(text) > 10:  # Reasonable title length
+                    title = text
+                    break
     
     # Extract Price
     price = None
@@ -86,55 +105,149 @@ def extract_product_data(html: str) -> dict:
             if currency:
                 price = currency.get_text(strip=True) + price
     
-    # Extract Reviews Count
+    # Extract Reviews Count - Multiple methods
     reviews_count = 0
     reviews_selectors = [
         '#acrCustomerReviewText',
         'span#acrCustomerReviewText',
         'a#acrCustomerReviewLink span',
-        '#acrCustomerReviewLink'
+        '#acrCustomerReviewLink',
+        '#acrCustomerReviewLink span',
+        'a[data-hook="acr-link"]',
+        'span[data-hook="acr-link"]',
+        '#averageCustomerReviews span',
+        '.averageCustomerReviews span',
+        'a[href*="#customerReviews"] span',
+        '#reviewsMedley span',
+        'span.a-size-base'
     ]
+    
     for selector in reviews_selectors:
         element = soup.select_one(selector)
         if element:
             reviews_text = element.get_text(strip=True)
-            # Extract number from text like "1,234 ratings" or "1,234"
+            # Extract number from text like "1,234 ratings", "1,234", "1,234 customer reviews"
             numbers = re.findall(r'[\d,]+', reviews_text.replace(',', ''))
             if numbers:
                 try:
                     reviews_count = int(numbers[0].replace(',', ''))
-                    break
+                    if reviews_count > 0:
+                        break
                 except ValueError:
                     continue
     
-    # Extract BSR (Best Sellers Rank)
+    # Alternative: Search in text content for review patterns
+    if reviews_count == 0:
+        # Look for patterns like "X ratings" or "X customer reviews"
+        review_patterns = [
+            r'([\d,]+)\s*(?:customer\s*)?reviews?',
+            r'([\d,]+)\s*ratings?',
+            r'([\d,]+)\s*global\s*ratings?'
+        ]
+        page_text = soup.get_text()
+        for pattern in review_patterns:
+            match = re.search(pattern, page_text, re.IGNORECASE)
+            if match:
+                try:
+                    reviews_count = int(match.group(1).replace(',', ''))
+                    if reviews_count > 0:
+                        break
+                except ValueError:
+                    continue
+    
+    # Extract BSR (Best Sellers Rank) - Multiple extraction methods
     bsr = None
-    # BSR is usually in a section with "Best Sellers Rank"
-    bsr_section = soup.find('span', string=re.compile('Best Sellers Rank', re.I))
-    if bsr_section:
-        # Find the parent and look for rank number
-        parent = bsr_section.find_parent()
-        if parent:
-            bsr_text = parent.get_text()
-            # Look for pattern like "#123,456" or "#123456"
-            bsr_match = re.search(r'#\s*([\d,]+)', bsr_text)
+    
+    # Method 1: Find by text content containing "Best Sellers Rank"
+    bsr_text_patterns = [
+        r'Best\s+Sellers?\s+Rank[:\s]*#?\s*([\d,]+)',
+        r'#\s*([\d,]+)\s+in\s+.*?Best\s+Sellers',
+        r'Best\s+Sellers?\s+Rank[:\s]*([\d,]+)',
+        r'#([\d,]+)\s+in\s+[^#]*Best\s+Sellers'
+    ]
+    
+    # Search in all text elements
+    all_text = soup.get_text()
+    for pattern in bsr_text_patterns:
+        match = re.search(pattern, all_text, re.IGNORECASE)
+        if match:
+            try:
+                bsr = int(match.group(1).replace(',', ''))
+                if bsr > 0:
+                    break
+            except ValueError:
+                continue
+    
+    # Method 2: Find span/li elements containing BSR text
+    if bsr is None:
+        # Also try specific ID selectors first
+        sales_rank_elem = soup.find('span', {'id': 'SalesRank'}) or soup.find('span', {'id': 'productDetails_salesRank'})
+        if sales_rank_elem:
+            rank_text = sales_rank_elem.get_text()
+            bsr_match = re.search(r'#\s*([\d,]+)', rank_text)
+            if bsr_match:
+                try:
+                    bsr = int(bsr_match.group(1).replace(',', ''))
+                except ValueError:
+                    pass
+        
+        # Search for elements with BSR-related text
+        if bsr is None:
+            for elem in soup.find_all(['span', 'li', 'div']):
+            text = elem.get_text()
+            if 'Best Sellers Rank' in text or ('BSR' in text and 'rank' in text.lower()):
+                # Extract number from the element or its siblings
+                bsr_match = re.search(r'#\s*([\d,]+)', text)
+                if not bsr_match:
+                    bsr_match = re.search(r'([\d,]+)\s+in\s+.*?Best\s+Sellers', text, re.IGNORECASE)
+                if not bsr_match:
+                    # Just find the first large number in the text
+                    numbers = re.findall(r'([\d,]{3,})', text.replace(',', ''))
+                    if numbers:
+                        try:
+                            potential_bsr = int(numbers[0].replace(',', ''))
+                            if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
+                                bsr = potential_bsr
+                                break
+                        except ValueError:
+                            continue
+                else:
+                    try:
+                        bsr = int(bsr_match.group(1).replace(',', ''))
+                        if bsr > 0:
+                            break
+                    except ValueError:
+                        continue
+    
+    # Method 3: Look in product details section
+    if bsr is None:
+        product_details = soup.find('div', {'id': 'productDetails_db_sections'}) or \
+                         soup.find('div', {'id': 'detailBullets_feature_div'}) or \
+                         soup.find('table', {'id': 'productDetails_detailBullets_sections1'}) or \
+                         soup.find('div', {'id': 'productDetails_feature_div'})
+        
+        if product_details:
+            details_text = product_details.get_text()
+            bsr_match = re.search(r'Best\s+Sellers?\s+Rank[:\s]*#?\s*([\d,]+)', details_text, re.IGNORECASE)
             if bsr_match:
                 try:
                     bsr = int(bsr_match.group(1).replace(',', ''))
                 except ValueError:
                     pass
     
-    # Alternative BSR extraction method
+    # Method 4: Search in table rows (common Amazon structure)
     if bsr is None:
-        bsr_elements = soup.find_all('span', class_=re.compile('rank', re.I))
-        for elem in bsr_elements:
-            text = elem.get_text()
-            if 'Best Sellers Rank' in text or 'BSR' in text:
-                numbers = re.findall(r'[\d,]+', text.replace(',', ''))
+        for row in soup.find_all('tr'):
+            row_text = row.get_text()
+            if 'Best Sellers Rank' in row_text:
+                # Look for number in the same row
+                numbers = re.findall(r'([\d,]{3,})', row_text.replace(',', ''))
                 if numbers:
                     try:
-                        bsr = int(numbers[0].replace(',', ''))
-                        break
+                        potential_bsr = int(numbers[0].replace(',', ''))
+                        if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
+                            bsr = potential_bsr
+                            break
                     except ValueError:
                         continue
     
