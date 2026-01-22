@@ -1,17 +1,17 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import requests
 from bs4 import BeautifulSoup
+import os
 import re
 
 app = FastAPI(title="Amazon Product Verdict API")
 
-# ScraperAPI configuration
-SCRAPERAPI_KEY = "0ffd10481338d1ba06b0aaa980323394"
-SCRAPERAPI_URL = "http://api.scraperapi.com"
+# ScraperAPI Key - Pehle Environment se lega, nahi toh yahan manually dalein
+API_KEY = os.getenv("SCRAPER_API_KEY", "0ffd10481338d1ba06b0aaa980323394")
 
-class VerdictRequest(BaseModel):
-    url: HttpUrl
+class ProductRequest(BaseModel):
+    url: str
 
 class VerdictResponse(BaseModel):
     product_title: str
@@ -22,14 +22,14 @@ class VerdictResponse(BaseModel):
 
 def scrape_amazon_page(url: str) -> str:
     """Fetch HTML content from Amazon using ScraperAPI with JavaScript rendering"""
-    params = {
-        'api_key': SCRAPERAPI_KEY,
-        'url': url,
-        'render': 'true'  # Enable JavaScript rendering for Amazon
-    }
+    if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
+        raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
+    
+    # ScraperAPI URL structure with render=true
+    scraper_url = f"http://api.scraperapi.com?api_key={API_KEY}&url={url}&render=true"
     
     try:
-        response = requests.get(SCRAPERAPI_URL, params=params, timeout=60)
+        response = requests.get(scraper_url, timeout=60)
         response.raise_for_status()
         return response.text
     except requests.exceptions.RequestException as e:
@@ -194,30 +194,30 @@ def extract_product_data(html: str) -> dict:
         # Search for elements with BSR-related text
         if bsr is None:
             for elem in soup.find_all(['span', 'li', 'div']):
-            text = elem.get_text()
-            if 'Best Sellers Rank' in text or ('BSR' in text and 'rank' in text.lower()):
-                # Extract number from the element or its siblings
-                bsr_match = re.search(r'#\s*([\d,]+)', text)
-                if not bsr_match:
-                    bsr_match = re.search(r'([\d,]+)\s+in\s+.*?Best\s+Sellers', text, re.IGNORECASE)
-                if not bsr_match:
-                    # Just find the first large number in the text
-                    numbers = re.findall(r'([\d,]{3,})', text.replace(',', ''))
-                    if numbers:
+                text = elem.get_text()
+                if 'Best Sellers Rank' in text or ('BSR' in text and 'rank' in text.lower()):
+                    # Extract number from the element or its siblings
+                    bsr_match = re.search(r'#\s*([\d,]+)', text)
+                    if not bsr_match:
+                        bsr_match = re.search(r'([\d,]+)\s+in\s+.*?Best\s+Sellers', text, re.IGNORECASE)
+                    if not bsr_match:
+                        # Just find the first large number in the text
+                        numbers = re.findall(r'([\d,]{3,})', text.replace(',', ''))
+                        if numbers:
+                            try:
+                                potential_bsr = int(numbers[0].replace(',', ''))
+                                if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
+                                    bsr = potential_bsr
+                                    break
+                            except ValueError:
+                                continue
+                    else:
                         try:
-                            potential_bsr = int(numbers[0].replace(',', ''))
-                            if 1000 < potential_bsr < 10000000:  # Reasonable BSR range
-                                bsr = potential_bsr
+                            bsr = int(bsr_match.group(1).replace(',', ''))
+                            if bsr > 0:
                                 break
                         except ValueError:
                             continue
-                else:
-                    try:
-                        bsr = int(bsr_match.group(1).replace(',', ''))
-                        if bsr > 0:
-                            break
-                    except ValueError:
-                        continue
     
     # Method 3: Look in product details section
     if bsr is None:
@@ -271,28 +271,25 @@ def calculate_verdict(reviews_count: int, bsr: int) -> str:
         return '⚠️ RISKY'
 
 @app.get("/")
-def read_root():
-    return {
-        "message": "Amazon Product Verdict API",
-        "endpoint": "/verdict",
-        "usage": "POST /verdict with JSON body: {\"url\": \"https://amazon.com/...\"}"
-    }
+def home():
+    return {"status": "API is Running", "docs": "/docs"}
 
 @app.post("/verdict", response_model=VerdictResponse)
-async def get_verdict(request: VerdictRequest):
+def get_verdict(request: ProductRequest):
     """
     Analyze an Amazon product and return verdict
     
     - **url**: Amazon product URL
     """
-    url_str = str(request.url)
+    if not API_KEY or API_KEY == "YOUR_ACTUAL_KEY_HERE":
+        raise HTTPException(status_code=500, detail="ScraperAPI Key is missing!")
     
     # Validate it's an Amazon URL
-    if 'amazon' not in url_str.lower():
+    if 'amazon' not in request.url.lower():
         raise HTTPException(status_code=400, detail="URL must be an Amazon product page")
     
     # Scrape the page
-    html = scrape_amazon_page(url_str)
+    html = scrape_amazon_page(request.url)
     
     # Extract product data
     product_data = extract_product_data(html)
